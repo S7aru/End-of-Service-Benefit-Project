@@ -1,0 +1,310 @@
+---
+title: "End-of-Service Benefit Project"
+author: "Abdulaziz Alsahhar"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: cosmo
+    df_print: paged
+---
+# Objective
+
+This project develops an **End-of-Service Benefit (EOSB) model** under IAS-19 using the **Projected Unit Credit (PUC)** actuarial method.  
+
+The model workflow:  
+- Import employee data from Excel (**ID**, **Date of Birth**, **Date of Hire**, **Current Salary**)  
+- Apply actuarial assumptions provided by the user (**Salary Growth Rate**, **Discount Rate**, **Withdrawal Multiple**)  
+- Project employees’ future salaries, service, and benefit accruals  
+- Apply mortality and withdrawal probabilities from a two-decrement table  
+- Calculate the **Present Value of Defined Benefit Obligation (PVDBO)**  
+- Perform **sensitivity analysis** on key assumptions  
+- Compute the **effective duration** of liabilities 
+
+
+## Data & Setup
+
+### Importing Data
+```{r, echo=TRUE, results='hide',message=FALSE, warning=FALSE}
+start <- Sys.time()
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(tibble)
+options(scipen = 999)
+
+employee_data <- read_excel("EOSB Project.xlsm", sheet = 1)
+employee_data <- employee_data %>% 
+  select(c(2:5)) %>%
+  clean_names() %>%
+  mutate(date_of_birth = as.Date(date_of_birth), date_of_hire = as.Date(date_of_hire))
+```
+-
+-
+-
+```{r}
+employee_data
+
+```
+### - Assumptions
+```{r}
+discount_rate <- 0.05
+salary_growth <- 0.05
+withdrawal_multiple <- 10
+valuation_date = as.Date("2024-12-31")
+```
+
+
+### - Decrement Table (Mortality & Withdrawal)
+```{r,echo=TRUE, results='hide',message=FALSE, warning=FALSE}
+decrement_table <- read_excel("EOSB Project.xlsm", sheet = "Decrements")
+decrement_table <- decrement_table %>%
+  select(7,8) %>%
+  slice(-1)  %>%
+  rename(mortality = 1, withdrawal = 2) %>%
+  mutate(mortality=as.numeric(mortality),withdrawal=as.numeric(withdrawal)) %>%
+  mutate(withdrawal = withdrawal*withdrawal_multiple) %>%
+  mutate(age = c(20:65),.before = mortality) #To add an age column 
+```
+-
+-
+-
+```{r}
+decrement_table
+```
+
+### - Normal Retirement Age
+- As per **GOSI regulations (effective 3 July 2024)**, retirement age depends on the employee’s age on that date.
+```{r,echo=TRUE, results='hide',message=FALSE, warning=FALSE}
+normal_retirement_age <- read_excel("EOSB Project.xlsm", sheet = "Decrements")
+normal_retirement_age <- normal_retirement_age %>% 
+  select(Age,Retirement) %>%
+  slice(c(1:21)) %>%
+  clean_names()
+
+```
+-
+-
+-
+```{r}
+normal_retirement_age
+```
+
+We add **current age**, **years of service**, and **retirement age assumption** (based on the previous table: normal_retirement_age).
+Unnecessary columns (date of birth, date of hire) are removed
+
+```{r}
+employee_data <- employee_data %>%
+  mutate(current_age = as.numeric((valuation_date-date_of_birth)/365.25),.before = date_of_birth) %>%
+  mutate(current_service = as.numeric((valuation_date-date_of_hire)/365.25),.before = date_of_birth) %>%
+  mutate(age_at_gosi_laws = as.numeric(as.Date("2024-7-3")-date_of_birth)/365.25,.before = salary) %>%
+  mutate(age_at_gosi_laws = trunc(pmin(pmax(age_at_gosi_laws,28),48))) %>%
+  left_join(normal_retirement_age,by = c("age_at_gosi_laws"="age")) %>%
+  select(-age_at_gosi_laws) %>%
+  relocate(retirement,.before = salary) %>%
+  select(-c(date_of_hire,date_of_birth))
+
+employee_data
+```
+## Future Projections
+We project **age**, **service**, and **salary** for each employee until retirement.
+```{r}
+
+working_data <- employee_data %>%
+  crossing(year = c(0:45)) %>%
+  mutate(proj_year = year) %>%
+  mutate(age_proj = current_age + year) %>%
+  mutate(service_proj = current_service + year) %>%
+  mutate(salary_proj = salary*(1+salary_growth)^(year+1)) %>%
+  filter(if_else(current_age >= retirement,year == 0,age_proj<=retirement)) %>%
+  select(employee_id,proj_year,age_proj,salary_proj,service_proj,retirement) 
+working_data
+```
+- 
+- 
+- 
+Sample projection:
+```{r}
+head(working_data,n = 40)
+```
+
+
+### Benefit Calculation Methedology
+
+According to Saudi Labor Law (GOSI-based EOSB rules):
+
+- Half monthly salary per year of service for the first 5 years
+
+- One monthly salary per year of service thereafter
+
+For simplicity, all exits are assumed to be **contract terminations**.
+
+```{r}
+working_data <- working_data %>%
+  mutate(EOSB = if_else(service_proj >5, 5*0.5*salary_proj + (service_proj - 5)*salary_proj,service_proj*0.5*salary_proj))
+working_data
+```
+
+### Applying Mortality & Withdrawal
+Probabilities are applied to weight future cashflows.
+
+```{r}
+working_data <- working_data %>%
+  mutate(truncated_age_proj = as.integer(pmin(pmax(20,trunc(age_proj)),65))) %>%
+  select(-any_of(c("mortality", "withdrawal"))) %>%
+  left_join(decrement_table,by = c("truncated_age_proj"="age")) %>%
+  group_by(employee_id) %>%
+  mutate(survival = lag(cumprod(1 - mortality - withdrawal),default = 1)) %>%
+  ungroup() %>%
+  mutate(mortality  = mortality*survival, withdrawal = withdrawal*survival) %>%
+  select(-truncated_age_proj) 
+
+working_data
+  
+
+```
+### Probability-Weighted Cashflows
+At each projection year:
+
+- Before retirement: EOSB*(P(Death)+P(Withdrawal))
+
+- At retirement: EOSB*P(Surviving to that year)
+
+**Note:** Employees who have already reached or exceeded the normal retirement age at the valuation date  
+(e.g., an employee aged 70 who is still in service) are assumed to **retire immediately**. 
+
+```{r}
+working_data <- working_data %>%
+  mutate(undiscounted = if_else(age_proj >= retirement-1, false = EOSB*(mortality+withdrawal),true = EOSB*survival))
+working_data
+  
+```
+
+### Discounting to Present Value
+Assuming mid-year payment timing.
+
+```{r}
+working_data <- working_data %>%
+  mutate(discounted = undiscounted*(1+discount_rate)^-(0.5+proj_year)) 
+  working_data
+```
+
+### Straight-Line Attribution (IAS-19)
+Distribute discounted benefits across years of service. That is:
+\[
+PVDBO = \text{Discounted Cashflow} \times \frac{\text{Service Years at Valuation}}{\text{Total Service Years at Projection}}
+\]
+```{r}
+#working_data <- working_data %>%
+# group_by(employee_id) %>%
+# mutate(PVDBO = if_else(condition = service_proj>0,true = discounted*(first(service_proj)/service_proj),false = 0))
+
+first_service <- working_data %>%
+  group_by(employee_id) %>%
+  summarise(first_service = first(service_proj), .groups = "drop")
+
+working_data <- working_data %>%
+  left_join(first_service, by = "employee_id") %>%
+  mutate(PVDBO = if_else(service_proj > 0, discounted * (first_service / service_proj),0))
+working_data
+```
+The first code (in comment) was calling first(service_proj) in every single row, which was not efficient. The one used  resulted in 45% cut in run time at 100k employees level (10m rows)
+
+### Total PVDBO
+```{r}
+individual_results = working_data %>%
+  group_by(employee_id) %>%
+  summarise(total_PVDBO = sum(PVDBO)) 
+
+final_result = sum(individual_results$total_PVDBO)
+final_result
+```
+
+## Sensitivity Analysis & Effective Duration
+
+We test ±1% to discount rate and salary growth.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+compute_pvdbo <- function(discount, salary_increase) {
+  # discount  = 0.05 means 5%
+  # salary_increase = 0.05 means 5%
+
+  wd <- employee_data %>%
+    crossing(year = 0:45) %>%
+    mutate(
+      proj_year    = year,
+      age_proj     = current_age + year,
+      service_proj = current_service + year,
+      salary_proj  = salary * (1 + salary_increase)^(year + 1)
+    ) %>%
+    filter(if_else(current_age >= retirement, year == 0, age_proj <= retirement)) %>%
+    select(employee_id, proj_year, age_proj, salary_proj, service_proj, retirement) %>%
+    mutate(EOSB = if_else(service_proj > 5,
+                          5*0.5*salary_proj + (service_proj - 5)*salary_proj,
+                          service_proj*0.5*salary_proj)) %>%
+    mutate(truncated_age_proj = as.integer(pmin(pmax(20, trunc(age_proj)), 65))) %>%
+    select(-any_of(c("mortality","withdrawal"))) %>%
+    left_join(decrement_table, by = c("truncated_age_proj" = "age")) %>%
+    group_by(employee_id) %>%
+    mutate(survival = lag(cumprod(1 - mortality - withdrawal), default = 1)) %>%
+    ungroup() %>%
+    mutate(
+      mortality    = mortality  * survival,
+      withdrawal   = withdrawal * survival,
+      undiscounted = if_else(age_proj >= retirement - 1,
+                             EOSB * survival,
+                             EOSB * (mortality + withdrawal)),
+      discounted   = undiscounted * (1 + discount)^-(0.5 + proj_year)
+    )
+
+  first_service <- wd %>%
+    group_by(employee_id) %>%
+    summarise(first_service = first(service_proj), .groups = "drop")
+
+  wd %>%
+    left_join(first_service, by = "employee_id") %>%
+    mutate(PVDBO = if_else(service_proj > 0, discounted * (first_service / service_proj), 0)) %>%
+    group_by(employee_id) %>%
+    summarise(total_PVDBO = sum(PVDBO), .groups = "drop") %>%
+    summarise(PVDBO_total = sum(total_PVDBO)) %>%
+    pull(PVDBO_total)
+}
+```
+
+```{r sensitivity_analysis, echo=TRUE, message=FALSE, warning=FALSE}
+
+# Baseline total you already computed:
+base_val <- final_result
+
+sg_base <- salary_growth
+dr_base <- discount_rate
+
+results <- tibble(
+  Scenario = c("Base",
+               "+1% Discount Rate", "-1% Discount Rate",
+               "+1% Salary Growth", "-1% Salary Growth"),
+  PVDBO = c(
+    base_val,
+    compute_pvdbo(dr_base + 0.01, sg_base),
+    compute_pvdbo(dr_base - 0.01, sg_base),
+    compute_pvdbo(dr_base,         sg_base + 0.01),
+    compute_pvdbo(dr_base,         sg_base - 0.01)
+  )
+) %>%
+  mutate(
+    Delta     = PVDBO - first(PVDBO),
+    Delta_pct = Delta/first(PVDBO)
+  )
+
+duration = (results$PVDBO[3]-results$PVDBO[2])/(2*results$PVDBO[1]*0.01)
+results
+```
+
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+duration
+end <- Sys.time()
+end - start
+```
+
+
+
