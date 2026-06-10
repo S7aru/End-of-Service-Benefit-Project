@@ -6,7 +6,7 @@ Abdulaziz Alsahhar
 # Objective
 
 This project develops an **End-of-Service Benefit (EOSB) model** under
-IAS-19 using the **Projected Unit Credit (PUC)** actuarial method in R. [To download the Excel model click here](model.xlsx)
+IAS-19 using the **Projected Unit Credit (PUC)** actuarial method in R. [To download the Excel model click here](model.xlsm)
 
 The model workflow:  
 - Import employee data from Excel (**ID**, **Date of Birth**, **Date of
